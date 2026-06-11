@@ -288,3 +288,179 @@ az acr run --registry myregistry \
 - Context `/dev/null` = no source files needed
 - Store PATs in **Azure Key Vault**
 - Cron schedule format used for scheduled triggers: `"0 0 * * *"` = midnight UTC daily
+
+# ACR Tagging Strategies — Study Notes
+
+## Stable vs Unique Tags
+
+| | **Stable Tags** | **Unique Tags** |
+|---|---|---|
+| Examples | `v1`, `v1.2`, `latest` | `v1.2.0-build456`, `20260102-abc123` |
+| Behavior | Tag **moves** to new image on push | Tag is **never reused** |
+| Predictability | ❌ Nodes may receive different images | ✅ Every node pulls exact same image |
+| Use case | Base images, dev environments | Production deployments, audits, rollbacks |
+
+> ⚠️ Stable tags are **mutable** — the previous image stays in the registry but loses the tag reference.
+
+---
+
+## Semantic Versioning — `MAJOR.MINOR.PATCH`
+
+| Part | Increment when... | Example |
+|------|-------------------|---------|
+| **MAJOR** | Breaking changes (API changes, removed features) | `1.x.x` → `2.0.0` |
+| **MINOR** | New backward-compatible features | `1.0.x` → `1.1.0` |
+| **PATCH** | Bug fixes, security patches | `1.1.0` → `1.1.1` |
+
+### Combined Stable + Unique Tag Strategy
+
+```
+inference-api:1        # Stable → latest 1.x.x (auto-updates within major)
+inference-api:1.1      # Stable → latest 1.1.x
+inference-api:1.1.0    # Unique → exact patch version (production-safe)
+```
+
+Consumers referencing `:1` get automatic updates within the major version. Those referencing `:1.1.0` get exactly that version.
+
+---
+
+## Unique Tag Patterns for Production
+
+### Build ID Tags
+```
+inference-api:build-4567
+```
+Links image → specific CI/CD pipeline run (logs, test results, artifacts)
+
+### Git Commit SHA Tags
+```
+inference-api:abc123f
+```
+Links image → exact source code state. Anyone with repo access can look up the code.
+
+### Timestamp Tags
+```
+inference-api:20260102-143022
+```
+Shows image age at a glance; easy to spot outdated versions.
+
+### Combined (Maximum Traceability)
+```
+inference-api:v1.2.0-build4567-abc123f
+```
+Semantic version + build ID + commit hash — ideal for incident response.
+
+```bash
+# Using ACR Tasks run variable for unique tags
+az acr build --registry myregistry \
+  --image inference-api:v1.2.0-{{.Run.ID}} .
+```
+
+---
+
+## The `latest` Tag — Avoid in Production
+
+**Problems with `latest`:**
+- Different nodes may pull at different times → receive different images
+- Deployments change silently when someone pushes a new image
+- Hard to troubleshoot — you don't know which version is actually running
+
+```yaml
+# ❌ Avoid in production
+image: myregistry.azurecr.io/inference-api:latest
+
+# ✅ Use explicit versions
+image: myregistry.azurecr.io/inference-api:v1.2.0
+```
+
+> `latest` is acceptable in **development only** where convenience > consistency.
+
+---
+
+## Locking Images
+
+Lock production images to prevent accidental deletion or overwrite.
+
+```bash
+# Lock an image
+az acr repository update \
+  --name myregistry \
+  --image inference-api:v1.2.0 \
+  --write-enabled false
+
+# Unlock when retiring
+az acr repository update \
+  --name myregistry \
+  --image inference-api:v1.2.0 \
+  --write-enabled true
+```
+
+**Locked images:**
+- Cannot be deleted (even by admins)
+- Cannot be overwritten (pushing same tag fails)
+- Survive retention policies and auto-cleanup
+- Keep production workloads stable
+
+---
+
+## Cleaning Up Untagged Images
+
+When a stable tag moves to a new image, the previous image becomes **untagged ("orphan")** — it still consumes storage.
+
+### On-Demand Purge
+
+```bash
+az acr run --registry myregistry \
+  --cmd "acr purge --filter 'inference-api:.*' --untagged --ago 30d" \
+  /dev/null
+```
+
+Removes untagged images in `inference-api` repo older than 30 days. Filter uses regex.
+
+### Scheduled Auto-Cleanup
+
+```bash
+az acr task create \
+  --registry myregistry \
+  --name cleanup-untagged \
+  --cmd "acr purge --filter '.*:.*' --untagged --ago 7d" \
+  --schedule "0 0 * * 0" \
+  --context /dev/null
+```
+
+Runs **weekly** (`0 0 * * 0` = Sunday midnight UTC), removes all untagged images older than 7 days.
+
+### Retention Policies
+- Simpler alternative to scheduled purge tasks
+- **Premium tier only**
+- Set once at registry level — applies registry-wide automatically
+
+---
+
+## Best Practices Summary
+
+| Practice | Why |
+|----------|-----|
+| **Unique tags in production** | Guarantee consistency across all nodes |
+| **Stable tags for base images** | Allow security updates to flow automatically |
+| **Lock production images** | Prevent accidental deletion while actively serving traffic |
+| **Schedule cleanup tasks** | Prevent storage cost creep from orphan images |
+| **Include build metadata in tags** | Traceability for debugging and audits |
+| **Document your tagging scheme** | Ensure team consistency |
+
+---
+
+## Quick-Fire Exam Facts
+
+- Stable tags = **mutable** (tag pointer moves on push)
+- Unique tags = **never reused** (new tag every push)
+- Semantic versioning: `MAJOR.MINOR.PATCH`
+- `latest` = default when no tag is specified — **avoid in production**
+- `--write-enabled false` = locks an image
+- Locked images **survive retention policies**
+- `acr purge` runs as a **container within ACR Tasks**
+- `--ago 30d` = target images older than 30 days
+- `/dev/null` context = no source files needed
+- Retention policies (registry-wide) = **Premium tier only**
+- `{{.Run.ID}}` = unique identifier per ACR task run
+- Cron `0 0 * * 0` = weekly, Sunday midnight UTC
