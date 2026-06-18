@@ -296,3 +296,210 @@ az containerapp replica list -n ai-api -g rg-aca-demo \
 - **Managed Identity + AcrPull** = best practice for ACR auth in production.
 - Image pull failures often **mimic authentication errors** — check registry config & lowercase image names.
 - Logs → Revisions → Replicas = standard troubleshooting order.
+
+
+# Azure Container Apps — Exam & Reference Notes
+
+---
+
+## 1. Image Updates & Revision Management
+
+### Tags vs. Digests
+| | Tags | Digests |
+|---|---|---|
+| **Identity** | Mutable (can change) | Immutable (fixed) |
+| **Use case** | Dev/staging iteration | Production releases |
+| **Traceability** | Low | High — proves exact artifact |
+
+> **Key rule:** Use **digests** in production so you can audit exactly what served requests during an incident.
+
+### Update Image → Creates New Revision
+```bash
+az containerapp update \
+  --name <app> --resource-group <rg> \
+  --image <registry>/<repo>@sha256:<digest>
+```
+
+Verify the image was recorded:
+```bash
+az containerapp show \
+  --name <app> --resource-group <rg> \
+  --query properties.template.containers
+```
+
+---
+
+## 2. Revision Modes
+
+| Mode | Behavior |
+|---|---|
+| **Single** | Only one active revision at a time; simpler ops |
+| **Multiple** | Multiple active revisions; enables canary/traffic-split rollouts |
+
+**"Active"** = revision can receive traffic. Inactive revisions still exist and are useful for rollback/investigation.
+
+### Revision Commands
+```bash
+# List all revisions
+az containerapp revision list --name <app> --resource-group <rg> -o table
+
+# Inspect a specific revision
+az containerapp revision show --name <app> --resource-group <rg> --revision <rev-name>
+
+# Deactivate (safe first step — preserves evidence)
+az containerapp revision deactivate --name <app> --resource-group <rg> --revision <rev-name>
+```
+
+> **Deactivate before delete** — stops traffic, keeps rollback options, preserves evidence.
+
+**Revision retention:** Auto-purge kicks in at **100 inactive revisions**. Adjust with `--max-inactive-revisions`.
+
+---
+
+## 3. App Lifecycle: Stop / Start / Restart
+
+| Action | Scope | When to use |
+|---|---|---|
+| **Stop** | Whole app | Guarantee no replicas start during incident mitigation |
+| **Start** | Whole app | Resume after stop |
+| **Restart** | Whole app | Clear transient runtime state (deadlock, stuck process) |
+| **Revision deactivate** | Single revision | Isolate one bad release without affecting others |
+
+```bash
+az containerapp stop    --name <app> --resource-group <rg>
+az containerapp start   --name <app> --resource-group <rg>
+az containerapp restart --name <app> --resource-group <rg>
+```
+
+> ⚠️ For AI services: restarting too often increases **cold starts** (model loading is slow). Use restart intentionally.
+
+---
+
+## 4. Failing Revision Checklist
+
+When a revision fails, check these in order:
+
+1. **Image pull failure** — registry credentials missing/invalid, or wrong image reference
+2. **Port mismatch** — container listens on a different port than ingress expects
+3. **Missing config** — required env vars or secrets not set/misnamed
+4. **Probe failure** — wrong path, or too short a timeout for model loading
+5. **Resource pressure** — OOM kill (memory) or throttling (CPU)
+
+Quick status query:
+```bash
+az containerapp revision list \
+  --name <app> --resource-group <rg> \
+  --query "[].{name:name,active:properties.active,health:properties.healthState}" \
+  -o table
+```
+
+---
+
+## 5. Logs & Monitoring
+
+### Stream logs in real time
+```bash
+az containerapp logs show \
+  --name <app> --resource-group <rg> \
+  --follow
+```
+
+### Recommended log fields for AI services
+| Field | Purpose |
+|---|---|
+| Request/Correlation ID | Trace requests across services |
+| Revision / Build ID | Matches image tag or digest |
+| Model version | Know which model handled the request |
+| Latency breakdown | Total + per-dependency timings |
+
+> Log **identifiers and metadata**, not raw prompts or documents — balance debuggability with data privacy.
+
+### Incident workflow
+1. Identify which revision is active and which is failing
+2. Stream logs while reproducing the issue
+3. Compare config between working and failing revision
+4. Apply fix → verify new revision becomes ready
+
+---
+
+## 6. Health Probes
+
+### Readiness vs. Liveness
+| Probe | Question | Failure action |
+|---|---|---|
+| **Readiness** | Can this replica take traffic now? | Stop routing to it |
+| **Liveness** | Is the process healthy enough to run? | Restart the replica |
+
+> For AI: Readiness = guard for model loading. Liveness = safety valve for deadlocks/runaway memory.
+
+### Sample YAML config
+```yaml
+probes:
+- type: Readiness
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 20   # time before first check
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+- type: Liveness
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 60   # give model time to load
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+```
+
+### Common probe failure causes
+- Wrong port or path
+- Timeout too short for model warmup
+- Startup dependency (DB, cache) is slow or unavailable
+
+> If you see liveness failures shortly after startup → liveness is **too aggressive** or the process fails fast due to misconfiguration.
+
+---
+
+## 7. Resource Sizing & Scaling
+
+### Update CPU / Memory
+```bash
+az containerapp update \
+  --name <app> --resource-group <rg> \
+  --cpu <cores> --memory <size>
+```
+
+### Sizing signals
+| Symptom | Fix |
+|---|---|
+| High latency, throttling | Increase **CPU** |
+| OOM restarts | Increase **memory** |
+| Cold starts too frequent | Set **minimum replicas > 0** |
+
+### API vs. Background worker
+| Workload | Strategy |
+|---|---|
+| Synchronous API | Set min replicas; predictable latency |
+| Background / event-driven | Scale to zero is OK if drain is safe |
+
+### Cost formula
+> **Total cost = per-replica cost × number of replicas**
+
+Minimum replicas reduce cold starts but **raise baseline cost** — use intentionally.
+
+---
+
+## 8. Safe Rollout — Best Practices Summary
+
+1. **Use image digests** for production deployments
+2. **Verify revision health** (status + probes + logs) before shifting traffic
+3. **Deactivate first**, investigate second
+4. **Define a retention strategy** (`--max-inactive-revisions`)
+5. **Tune probes** to match real startup time (especially for model loading)
+6. **Change one variable at a time** when optimizing resources
+7. **Reassess after every model version change** — startup time, memory, and latency can all shift
+
+---
