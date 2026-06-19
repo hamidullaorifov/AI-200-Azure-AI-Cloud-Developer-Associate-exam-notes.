@@ -503,3 +503,314 @@ Minimum replicas reduce cold starts but **raise baseline cost** — use intentio
 7. **Reassess after every model version change** — startup time, memory, and latency can all shift
 
 ---
+
+
+# Azure Container Apps — Scaling & Resource Management
+### Certification & Reference Notes
+
+---
+
+## 1. Scale Definitions (Core Concepts)
+
+Three components make up every scale definition:
+
+| Component | What it does |
+|-----------|-------------|
+| **Limits** | Min & max replica count |
+| **Rules** | Triggers that cause scaling |
+| **Behavior** | Timing, algorithms, step logic |
+
+> **Powered by KEDA** (Kubernetes Event-driven Autoscaling) under the hood.
+
+**Defaults (when ingress is enabled, no custom rules):**
+- Min replicas: **0**, Max replicas: **10**
+- If ingress is **disabled** and no min/rule is set → app scales to zero and **cannot restart** (no trigger)
+
+**Billing:**
+- Zero replicas = **no compute charges**
+- Idle replicas = **lower idle rate**
+- Min ≥ 1 = always available but always billed
+
+---
+
+## 2. HTTP Scale Rules
+
+- Scales based on **concurrent HTTP requests**
+- Calculated as: requests in last 15 sec ÷ 15
+- **Default threshold:** 10 requests/replica
+
+```bash
+az containerapp create \
+  --name order-api \
+  --scale-rule-type http \
+  --scale-rule-http-concurrency 50 \
+  --min-replicas 1 --max-replicas 10
+```
+
+✅ Best for: REST APIs, web apps  
+✅ Supports scale-to-zero  
+❌ Not available for Container Apps **Jobs**
+
+---
+
+## 3. TCP Scale Rules
+
+- Scales based on **concurrent TCP connections**
+- Uses same 15-second averaging window
+- Parameter: `--scale-rule-tcp-concurrency`
+
+✅ Best for: WebSockets, gRPC, database connection pools  
+✅ Supports scale-to-zero
+
+---
+
+## 4. CPU & Memory Scale Rules
+
+- Implemented as **KEDA custom scalers**
+- Triggers when average utilization % exceeds threshold
+
+```yaml
+- name: cpu-scaling
+  custom:
+    type: cpu
+    metadata:
+      type: Utilization
+      value: "70"
+```
+
+⚠️ **Critical limitation:** CPU/memory rules **cannot scale to zero** — always need ≥ 1 replica to measure  
+✅ Best for: Image processing, ML inference (CPU); caching, large datasets (memory)  
+💡 Combine with HTTP rules if you need scale-to-zero
+
+---
+
+## 5. Scale Behavior & Timing
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Polling interval (custom scalers) | **30 sec** | CPU, memory, event-driven |
+| Calculation window (HTTP/TCP) | **15 sec** | |
+| Cool-down period (scale-to-zero) | **300 sec (5 min)** | |
+| Scale-up stabilization window | **0 sec** | Scales up immediately |
+| Scale-down stabilization window | **300 sec** | Waits before removing replicas |
+
+**Scale-up steps:** 1 → 4 → 8 → 16 → 32 → ... (doubles each step)  
+**Scale-down:** removes all needed replicas at once
+
+---
+
+## 6. Event-Driven Scaling (KEDA)
+
+### Azure-Native Scalers (Microsoft-maintained)
+- Azure Service Bus
+- Azure Event Hubs
+- Azure Storage Queue
+- Azure Blob Storage
+- Azure Log Analytics
+- Azure Monitor
+
+All support **scale-to-zero** ✅
+
+### Service Bus Scaling
+- Monitors: **active message count**
+- Formula: messages ÷ messageCount threshold = desired replicas
+- Example: 50 messages ÷ threshold 5 = **10 replicas**
+
+```bash
+--scale-rule-type azure-servicebus \
+--scale-rule-metadata "queueName=orders" "namespace=sb-ecommerce" "messageCount=5" \
+--scale-rule-auth "connection=sb-connection"
+```
+
+### Storage Queue Scaling
+- Parameter: `queueLength`
+- Simpler/cheaper than Service Bus
+- No sessions, dead-letter, or scheduled messages
+- Good for basic queue workloads
+
+### Event Hubs Scaling
+- Monitors: **consumer group lag** (unprocessed events per partition)
+- Key param: `unprocessedEventThreshold`
+- **Max useful replicas = partition count** (1 consumer per partition per group)
+- Use `checkpointStrategy: blobMetadata` (recommended)
+
+---
+
+## 7. Authentication for Scale Rules
+
+| Method | How | Pros |
+|--------|-----|------|
+| **Secrets** | Connection string stored as secret, referenced in `--scale-rule-auth` | Works everywhere |
+| **Managed Identity** | Assign identity + RBAC role (e.g., Service Bus Data Receiver) | ✅ No secrets, no rotation |
+
+> **Production best practice:** Always prefer **managed identity** when supported.
+
+```bash
+--scale-rule-identity <MANAGED_IDENTITY_RESOURCE_ID>
+```
+
+---
+
+## 8. KEDA Custom Scalers
+
+### Apache Kafka
+- Monitors: **consumer group lag** per partition
+- Key params: `bootstrapServers`, `consumerGroup`, `topic`, `lagThreshold`
+- Max effective replicas = **partition count**
+- Auth: SASL/PLAIN, SASL/SCRAM, TLS
+
+### Redis
+- **Redis Lists:** monitors list length via `LLEN`; params: `listName`, `listLength`
+- **Redis Streams:** monitors pending entries for consumer group (accounts for in-progress work)
+- Supports: standard, Cluster, Sentinel deployments
+
+### Cron Scaling
+- Scales on a **schedule**, not metrics
+- Params: `timezone`, `start` (cron expr), `end` (cron expr), `desiredReplicas`
+- Outside window → scaler is inactive
+- **Combine with HTTP/event rules** — platform uses highest replica count
+
+```yaml
+- name: business-hours
+  custom:
+    type: cron
+    metadata:
+      timezone: "America/New_York"
+      start: "0 8 * * 1-5"   # 8 AM Mon-Fri
+      end: "0 18 * * 1-5"    # 6 PM Mon-Fri
+      desiredReplicas: "5"
+```
+
+### Prometheus Scaling
+- Queries Prometheus with **PromQL**
+- Formula: query result ÷ threshold = desired replicas
+- Good for custom business metrics (sessions, transactions, etc.)
+
+---
+
+## 9. Converting KEDA → Container Apps
+
+| KEDA Field | Container Apps Equivalent |
+|-----------|--------------------------|
+| `triggers[].type` | `--scale-rule-type` |
+| `triggers[].metadata` | `--scale-rule-metadata` |
+| `TriggerAuthentication` | `--scale-rule-auth` or `--scale-rule-identity` |
+| `minReplicaCount` | `--min-replicas` |
+| `maxReplicaCount` | `--max-replicas` |
+
+> ⚠️ Container Apps does **not** support full `TriggerAuthentication` resource type or external scalers.
+
+---
+
+## 10. Resource Allocation
+
+### Rules & Constraints
+- CPU in **cores** (or fractions), memory in **GiB**
+- **Memory ≥ 2× CPU** (e.g., 0.5 CPU → min 1.0 GiB memory)
+- Defaults: **0.25 cores / 0.5 GiB**
+- **Consumption plan max:** 4 cores / 8 GiB per container
+
+### Behavior at Limits
+| Resource | Exceeds limit → |
+|----------|----------------|
+| **Memory** | Replica **terminated & restarted** |
+| **CPU** | Replica **throttled** (performance degrades, no crash) |
+
+```bash
+az containerapp create --cpu 0.5 --memory 1.0Gi \
+  --min-replicas 2 --max-replicas 20
+```
+
+---
+
+## 11. Environment Types & Workload Profiles
+
+| Type | Billing | Max Resources | Use When |
+|------|---------|---------------|----------|
+| **Consumption-only** | Pay-per-use | 4 cores / 8 GiB | Variable workloads, cost-sensitive |
+| **Consumption profile** (in WP env) | Pay-per-use | Same | Same as above |
+| **Dedicated profile** | Reserved VM | Larger + GPU | Consistent latency, compliance, GPU, >4 cores |
+
+> **Default for most workloads:** Consumption plan
+
+---
+
+## 12. Revision Modes
+
+### Revision Types
+- **Revision-scope changes** → create a new revision (image, scale rules, env vars)
+- **Application-scope changes** → no new revision (secrets, ingress, traffic rules)
+
+### Single Revision Mode (default)
+- One active revision at a time
+- Zero-downtime: new revision starts → health checked → traffic shifts → old deactivates
+- No configuration needed — automatic
+- ❌ No traffic splitting or gradual rollouts
+
+### Multiple Revision Mode
+```bash
+az containerapp update --revision-mode multiple
+```
+- Multiple revisions active simultaneously
+- Each scales **independently**
+- Revisions: **active** (receives traffic) or **inactive** (no resources, no traffic)
+- Max inactive revisions stored: **100**
+
+### Traffic Splitting
+```bash
+az containerapp ingress traffic set \
+  --revision-weight order-api--v1=80 order-api--v2=20
+```
+- Weights must total **100%**
+- Probabilistic routing
+- Use `latest` as revision name to auto-target newest revision
+
+### Revision Labels
+- Named URL that always routes to a specific revision
+- Independent of traffic splitting (label URL bypasses weights)
+- Use for: canary testing, blue-green deployments
+- Moving a label = **atomic redirect** (instant)
+- Naming: lowercase, letters/numbers/dashes, max 64 chars, no consecutive dashes
+
+---
+
+## 13. Key Formulas & Numbers to Remember
+
+| Fact | Value |
+|------|-------|
+| Default HTTP concurrency threshold | 10 req/replica |
+| HTTP/TCP calculation window | 15 seconds |
+| KEDA polling interval | 30 seconds |
+| Cool-down period | 300 sec (5 min) |
+| Scale-up stabilization | 0 sec (immediate) |
+| Scale-down stabilization | 300 sec |
+| Scale-up steps | 1, 4, 8, 16, 32... |
+| Max replicas per revision | 1,000 |
+| Max inactive revisions | 100 |
+| Consumption plan max per container | 4 cores / 8 GiB |
+| Memory constraint | ≥ 2× CPU value |
+
+---
+
+## 14. Quick Decision Guide
+
+**Which scale rule type?**
+```
+HTTP traffic (REST/web)       → HTTP scaling
+Persistent connections        → TCP scaling
+CPU-bound workloads           → CPU scaling (min 1 replica)
+Memory-intensive workloads    → Memory scaling (min 1 replica)
+Message queues (Azure)        → Service Bus / Storage Queue
+Event streaming               → Event Hubs / Kafka
+Scheduled peaks               → Cron (+ HTTP/event for spikes)
+Custom business metrics       → Prometheus
+```
+
+**Need scale-to-zero?**
+→ Use HTTP, TCP, or event-driven rules. Never CPU/memory alone.
+
+**Which auth method?**
+→ Always managed identity in production. Secrets for compatibility fallback.
+
+**Which revision mode?**
+→ Single for most deployments. Multiple only when you need canary/blue-green/A/B.
