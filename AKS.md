@@ -273,3 +273,255 @@ kubectl describe svc <svc>              # Service details & endpoints
 kubectl create secret generic <name> \
   --from-literal=<key>=<value>          # Create a Secret
 ```
+
+# Kubernetes Configuration & Storage — Exam Notes
+
+---
+
+## 1. ConfigMaps
+
+### What & Why
+- Stores **non-sensitive** configuration as key-value pairs
+- Keeps config out of container images and source code
+- Max size: **1 MiB** per ConfigMap
+- Keys: alphanumeric characters, dashes, underscores, or dots only
+
+### Define a ConfigMap
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-settings
+data:
+  FEATURE_X_ENABLED: "true"
+  SERVICE_ENDPOINT: "https://api.example.com"
+  app.config: |
+    log_level=info
+    timeout_seconds=30
+```
+
+### Inject as Environment Variables
+Two methods:
+
+| Method | YAML field | Use when |
+|---|---|---|
+| Single key | `valueFrom.configMapKeyRef` | You need specific keys |
+| All keys | `envFrom.configMapRef` | Many values, avoid repetitive YAML |
+
+```yaml
+env:
+- name: FEATURE_X_ENABLED
+  valueFrom:
+    configMapKeyRef:
+      name: app-settings
+      key: FEATURE_X_ENABLED
+# OR load all at once:
+envFrom:
+- configMapRef:
+    name: app-settings
+```
+
+### Mount as Files
+- Each ConfigMap key becomes a **file** in the mount directory
+- Use when the app expects config files on disk
+
+```yaml
+volumes:
+- name: config-volume
+  configMap:
+    name: app-settings
+containers:
+- name: api
+  volumeMounts:
+  - name: config-volume
+    mountPath: /app/config
+    readOnly: true
+```
+
+### ⚠️ Auto-Update Behavior
+| Injection method | Auto-updates? |
+|---|---|
+| Volume mount | ✅ Yes (kubelet sync period) |
+| Environment variable | ❌ No — requires Pod restart |
+| `subPath` mount | ❌ No |
+
+### Immutable ConfigMaps
+- Set `immutable: true` to prevent accidental changes
+- Performance benefit: Kubernetes closes watches → less API server load
+- **Cannot** change data or revert immutable setting once set
+- Must **delete and recreate** to make changes
+
+```yaml
+immutable: true
+```
+
+### Azure App Configuration Integration
+- **Azure App Configuration Kubernetes Provider** runs in the cluster
+- Generates standard Kubernetes ConfigMaps from App Configuration data
+- Syncs feature flags, endpoints, Key Vault references automatically
+- Useful for centralized config across multiple AKS clusters
+
+### Verify ConfigMaps
+```bash
+kubectl apply -f configmap.yaml
+kubectl describe configmap app-settings
+kubectl exec <pod-name> -- printenv | grep FEATURE
+```
+
+---
+
+## 2. Secrets
+
+### What & Why
+- Stores **sensitive** values: API keys, connection strings, passwords
+- Keeps credentials out of source control and images
+
+### Secret Types
+| Type | Use case |
+|---|---|
+| `Opaque` (default) | API keys, passwords, generic strings |
+| `kubernetes.io/dockerconfigjson` | Container registry credentials |
+| `kubernetes.io/tls` | TLS certificates and keys |
+
+### Create a Secret
+```bash
+kubectl create secret generic app-secrets \
+  --from-literal=DB_CONNECTION="Host=db;User=app;Password=secure" \
+  --from-literal=API_KEY="your-api-key"
+```
+
+### Reference in a Deployment
+```yaml
+env:
+- name: DB_CONNECTION
+  valueFrom:
+    secretKeyRef:
+      name: app-secrets
+      key: DB_CONNECTION
+```
+
+### Azure Secret Management Options
+
+| Option | How it works | Best for |
+|---|---|---|
+| **Key Vault + CSI Driver** | Mounts secrets from Key Vault directly as files; polls for changes | Strict compliance, fine-grained audit trails |
+| **App Configuration + Key Vault refs** | App Config stores references; provider resolves + generates K8s Secrets | Centralized secret mapping, standard K8s resources |
+
+### Best Practices ✅
+- **RBAC**: Restrict Secret access to only service accounts that need it
+- **No source control**: Never commit Secret manifests with literal values
+- **Rotate regularly**: Trigger Deployment rollouts after updates so Pods get new values
+- **Key Vault for production**: Enables automated rotation, audit trails
+- **Encrypt at rest**: Configure etcd encryption at cluster creation time
+
+### Verify Secrets
+```bash
+kubectl get secrets
+kubectl describe secret app-secrets   # shows keys, NOT values
+kubectl describe deployment web-api
+```
+
+---
+
+## 3. Persistent Storage
+
+### Why Persistent Storage?
+- Container filesystems are **ephemeral** — data lost on Pod restart/reschedule
+- **PersistentVolume (PV)** + **PersistentVolumeClaim (PVC)** provide durable storage
+
+### Two AKS Storage Approaches
+| Approach | Description | Best for |
+|---|---|---|
+| **CSI Drivers** | Standard StorageClasses; provisions Azure Disk, Files, Blob | General-purpose workloads |
+| **Azure Container Storage** | Container-native, NVMe-oF protocols, fast attach/detach | I/O intensive, rapid scaling of stateful workloads |
+
+### Default CSI StorageClasses
+
+| StorageClass | Backing | Access Mode | Performance | Use case |
+|---|---|---|---|---|
+| `managed-csi` | Azure Disk | ReadWriteOnce | Standard HDD/SSD | Single Pod, databases |
+| `managed-csi-premium` | Azure Disk Premium | ReadWriteOnce | Premium SSD | Low latency, high throughput |
+| `azurefile-csi` | Azure Files | ReadWriteMany | Standard HDD/SSD | Shared multi-Pod access |
+| `azurefile-csi-premium` | Azure Files Premium | ReadWriteMany | Premium SSD | High-perf shared access |
+
+### Access Modes
+- **ReadWriteOnce (RWO)**: Single node only → Azure Disk
+- **ReadWriteMany (RWX)**: Multiple nodes/Pods simultaneously → Azure Files
+
+### Define a PVC
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: default
+```
+
+### Mount PVC in a Deployment
+```yaml
+spec:
+  volumes:
+  - name: data-volume
+    persistentVolumeClaim:
+      claimName: data-pvc
+  containers:
+  - name: api
+    volumeMounts:
+    - name: data-volume
+      mountPath: /app/data
+```
+
+### Verify Persistence
+```bash
+kubectl apply -f pvc.yaml
+kubectl apply -f deployment.yaml
+kubectl describe pvc data-pvc          # should show: Status: Bound
+kubectl describe pod -l app=web-api
+```
+> **Test tip**: Write a file inside the Pod → delete Pod → check the file still exists in the new Pod.
+
+---
+
+## Quick Reference: Decision Cheatsheet
+
+```
+Need to store config?
+├── Non-sensitive → ConfigMap
+│   ├── App reads env vars? → envFrom / valueFrom
+│   └── App reads files? → Volume mount
+└── Sensitive → Secret
+    ├── Dev/test → Opaque Secret
+    └── Production → Azure Key Vault + CSI Driver
+
+Need storage?
+├── Single Pod access → Azure Disk (managed-csi / managed-csi-premium)
+├── Multi-Pod shared access → Azure Files (azurefile-csi / azurefile-csi-premium)
+└── High-perf stateful workloads → Azure Container Storage
+```
+
+---
+
+## Key kubectl Commands Summary
+
+```bash
+# ConfigMaps
+kubectl apply -f configmap.yaml
+kubectl describe configmap <name>
+kubectl exec <pod> -- printenv | grep <KEY>
+
+# Secrets
+kubectl create secret generic <name> --from-literal=KEY=value
+kubectl get secrets
+kubectl describe secret <name>
+
+# Storage
+kubectl describe pvc <name>
+kubectl get pods
+kubectl describe pod -l app=<label>
+```
