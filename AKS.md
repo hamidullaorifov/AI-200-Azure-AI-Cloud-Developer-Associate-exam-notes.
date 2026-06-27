@@ -525,3 +525,288 @@ kubectl describe pvc <name>
 kubectl get pods
 kubectl describe pod -l app=<label>
 ```
+
+
+# AKS Monitoring & Troubleshooting — Exam/Reference Notes
+
+---
+
+## 1. Monitor Application Logs & Metrics
+
+### Why It Matters
+- AI workloads (inference APIs, background processors) need predictable performance
+- Monitoring helps distinguish **normal variation** from **incidents**
+- Helps decide: scale, investigate, or roll back
+
+---
+
+### Key Signals to Watch
+
+| Signal | Why It Matters |
+|---|---|
+| Response latency & throughput | Core health of AI endpoints |
+| Error rates (HTTP 5xx, timeouts) | Reliability indicator |
+| Pod restart counts & exit codes | Container stability |
+| CPU & memory vs. requests/limits | Resource saturation |
+
+---
+
+### Viewing Logs — Azure Portal
+**Path:** AKS cluster → Kubernetes resources → Workloads → select pod → **Live Logs**
+
+- Streams `stdout` / `stderr` in real time
+- Can pause, search text, switch containers in multi-container pods
+- **Container Insights** (Monitoring → Insights): cross-pod log filtering by namespace/pod/container
+
+---
+
+### Viewing Logs — kubectl
+
+```bash
+kubectl get pods -n ai-workloads                          # list pods
+kubectl logs <pod-name> -n ai-workloads                   # view logs
+kubectl logs -f <pod-name> -n ai-workloads                # stream (follow)
+kubectl logs <pod-name> -c inference-api -n ai-workloads  # specific container
+```
+
+> `-n ai-workloads` targets a specific **namespace** (logical boundary grouping workloads)
+
+---
+
+### Viewing Metrics — Azure Portal
+**Path:** AKS cluster → Monitoring tab → Insights → Nodes / Controllers / Containers tabs
+
+- CPU & memory graphs per node pool
+- **Live Metrics** for individual pods (real-time CPU, memory, network)
+- Container insights: heat maps, performance charts
+
+---
+
+### Viewing Metrics — kubectl
+
+```bash
+kubectl top nodes               # per-node CPU & memory
+kubectl top pods -n ai-workloads  # per-pod CPU & memory
+```
+
+> Requires **metrics-server** installed on the cluster
+
+**High CPU** → model needs more resources or scale-out → can cause **inference latency**  
+**High memory** → container restarts or degraded performance
+
+---
+
+### Combined Workflow (Best Practice)
+
+```
+Portal Monitoring tab  →  quick health overview
+Live Logs (portal)     →  real-time investigation
+kubectl logs           →  filter/pipe output
+kubectl top            →  current resource snapshot
+Container Insights     →  historical trends, cross-pod analysis
+```
+
+---
+
+### Best Practices ✅
+- Use **structured logging** (JSON) — easier to query
+- Add **request IDs, model name, version** to log entries for tracing
+- Define **latency & error budget targets** and alert on thresholds
+- Start with portal for overview → kubectl for targeted queries
+
+---
+
+## 2. Troubleshoot Pods & Services
+
+### Common Pod Problem States
+
+| State | Cause |
+|---|---|
+| `ImagePullBackOff` | Wrong image reference or missing registry credentials |
+| `CrashLoopBackOff` | Container starts and exits repeatedly (app error) |
+| `Pending` | Can't schedule — insufficient resources |
+| Frequent restarts | Memory leaks or unhandled exceptions |
+
+---
+
+### Inspecting Pods — Azure Portal
+**Path:** AKS cluster → Workloads → select pod → Live Logs  
+**Diagnose and solve problems** (AKS menu) → automated diagnostics + remediation suggestions
+
+---
+
+### Inspecting Pods — kubectl
+
+```bash
+kubectl get pods -n ai-workloads
+kubectl describe pod <pod-name> -n ai-workloads
+kubectl get events -n ai-workloads   # recent events across all pods
+```
+
+**In `describe` output, check:**
+- Readiness & liveness probe results
+- Environment variables & mounted Secrets
+- Volume mounts (model files, config)
+- Events section (image pull errors, scheduling issues, probe failures)
+
+---
+
+### Debugging Inside a Container
+
+**Portal:** AKS cluster → Workloads → select pod → **Console** tab → choose shell
+
+**kubectl:**
+```bash
+kubectl exec -it <pod-name> -n ai-workloads -- /bin/sh
+```
+
+**Inside the container, check:**
+- Model files / config directories exist
+- Environment variables are correct
+- `curl http://localhost:8080/health` responds
+
+> ⚠️ Never make permanent fixes inside containers — update manifests/source code instead
+
+---
+
+### Inspecting Services — Azure Portal
+**Path:** AKS cluster → Services and ingresses → select Service
+
+Check: type, cluster IP, external IP, port mappings, **Endpoints** (empty = no backing pods)
+
+---
+
+### Inspecting Services — kubectl
+
+```bash
+kubectl get service -n ai-workloads
+kubectl describe service <service-name> -n ai-workloads
+kubectl get endpointslices -l kubernetes.io/service-name=<service-name> -n ai-workloads
+```
+
+**In Service definition, verify:**
+- **Selector labels** match pod labels
+- **Ports & targetPorts** align with container ports
+- **EndpointSlices** list actual pod IPs
+
+> Empty EndpointSlices = no traffic reaches pods, even if pods are healthy
+
+---
+
+### Best Practices ✅
+- Start with portal Workloads for quick restart-count overview
+- Use **Diagnose and solve problems** for guided auto-detection
+- Fix label mismatches first when a Service has no endpoints
+- Keep environment reproducible — changes via manifests only
+
+---
+
+## 3. Verify Service Connectivity & Endpoints
+
+### Kubernetes Service Types
+
+| Type | Scope | Use Case |
+|---|---|---|
+| `ClusterIP` | Internal only | Internal AI microservices |
+| `LoadBalancer` | External (Azure LB) | Public-facing AI APIs |
+| `NodePort` | Node-level port mapping | Less common |
+
+---
+
+### Reviewing Services — Azure Portal
+**Path:** AKS cluster → Services and ingresses
+
+- Filter by namespace
+- Check **External IP** column (LoadBalancer services)
+- Verify **selector labels** and **port configs**
+- Empty endpoints list = Service can't route traffic
+- Ingress resources: host rules, paths, backend services, external address
+
+---
+
+### Validating Service-to-Pod Connectivity — kubectl
+
+```bash
+kubectl get service -n ai-workloads
+kubectl describe service inference-api -n ai-workloads
+kubectl get endpointslices -l kubernetes.io/service-name=inference-api -n ai-workloads
+```
+
+**Verify:**
+1. Selector matches pod labels
+2. Ports/targetPorts align
+3. EndpointSlices contain pod IPs
+
+---
+
+### Testing Endpoints with Port-Forward
+
+```bash
+# Forward local port 8080 → Service port 80
+kubectl port-forward service/inference-api 8080:80 -n ai-workloads
+
+# In another terminal, test the endpoint
+curl http://localhost:8080/api/inference
+```
+
+> Useful before ingress is configured or for debugging new model endpoints
+
+---
+
+### Verifying External Connectivity
+
+**Portal:** Services and ingresses → External IP column (LoadBalancer) or Address column (Ingress)
+
+**kubectl:**
+```bash
+kubectl get service inference-api -n ai-workloads   # check EXTERNAL-IP
+kubectl get ingress -n ai-workloads                  # check Address column
+```
+
+---
+
+### Best Practices ✅
+- Use **consistent labels** across pods, Services, and ingress
+- Test with **port-forward** before exposing externally
+- Start portal → visual overview; kubectl → detailed endpoint inspection
+- Pair connectivity tests with **logs & metrics** to see config change impact
+
+---
+
+## Quick Reference — kubectl Cheat Sheet
+
+```bash
+# Pods
+kubectl get pods -n <ns>
+kubectl describe pod <name> -n <ns>
+kubectl logs <name> -n <ns>
+kubectl logs -f <name> -n <ns>                   # follow/stream
+kubectl logs <name> -c <container> -n <ns>       # specific container
+kubectl exec -it <name> -n <ns> -- /bin/sh       # shell into container
+
+# Resources
+kubectl top nodes
+kubectl top pods -n <ns>
+
+# Services & Networking
+kubectl get service -n <ns>
+kubectl describe service <name> -n <ns>
+kubectl get endpointslices -l kubernetes.io/service-name=<name> -n <ns>
+kubectl port-forward service/<name> <local>:<remote> -n <ns>
+kubectl get ingress -n <ns>
+
+# Events
+kubectl get events -n <ns>
+```
+
+---
+
+## Key Concepts to Remember
+
+- **Namespace** — logical boundary grouping related workloads; use `-n <namespace>` in kubectl
+- **Labels** — key/value pairs on pods; Services use **selectors** to match them
+- **EndpointSlices** — list of pod IPs a Service routes to; empty = broken connectivity
+- **Container Insights** — Azure Monitor integration for historical trends & cross-pod analysis
+- **Metrics Server** — must be installed for `kubectl top` to work
+- **CrashLoopBackOff** — container keeps crashing; check logs for app errors
+- **ImagePullBackOff** — image can't be pulled; check image name & registry credentials
