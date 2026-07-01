@@ -590,3 +590,278 @@ container.query_items_change_feed(start_time="Beginning")
 - Cosine similarity range: **-1 to +1** (practical: 0 to 1).
 - Hybrid search combines vector + full-text using **RRF** (`ORDER BY RANK RRF(...)`).
 - Change feed is **enabled by default**, requires a separate **lease container** for processing.
+
+# 🗂️ Azure Cosmos DB — Indexing & Consistency Notes
+
+> Quick-reference notes for exam prep and day-to-day work with Azure Cosmos DB for NoSQL.
+
+---
+
+## 1. Indexing Basics
+
+- **Default behavior:** Every property of every item is automatically indexed using **range indexes**.
+- **Pros of default:** No upfront config, all properties instantly queryable.
+- **Cons of default:** Wastes storage + write RU on properties that are never queried (e.g., large text, embeddings).
+- **Rule of thumb:** Customize indexing policy once you know your access patterns — especially for AI workloads with embeddings.
+
+---
+
+## 2. Index Types
+
+| Type | Purpose | Key Functions / Use Cases |
+|---|---|---|
+| **Range** | Equality (`=`), range (`>,<,>=,<=,!=`), `ORDER BY` on single property | `CONTAINS`, `STARTSWITH`, `ENDSWITH`, `StringEquals`, `IS_DEFINED` |
+| **Composite** | Sorting/filtering on **multiple properties together** | Multi-property `ORDER BY`, equality + range combo filters |
+| **Spatial** | Geo queries | `ST_DISTANCE`, `ST_WITHIN`, `ST_INTERSECTS` |
+| **Vector** | Similarity search on embeddings | `VectorDistance()` — flat, quantizedFlat, diskANN |
+| **Tuple** | Filtering on multiple properties **within array elements** | e.g., chunked documents (position + token count) |
+| **Full-text** | (covered elsewhere in path) | Full-text search |
+
+---
+
+## 3. Indexing Modes
+
+| Mode | Behavior | Notes |
+|---|---|---|
+| **Consistent** (default) | Index updated **synchronously** on every write | Queries always reflect latest writes |
+| **None** | Indexing disabled → container = key-value store | Only point reads (id + partition key) work; queries = full scan |
+| ~~Lazy~~ | **Deprecated** | Can't be used on new containers; migrate existing ones to Consistent |
+
+✅ **AI workloads → use Consistent** (need to find newly ingested docs/embeddings immediately).
+
+---
+
+## 4. Index Storage Cost Drivers
+
+- **# of indexed properties** — more paths = more storage
+- **Cardinality** — unique values (IDs, timestamps) cost more than low-cardinality fields
+- **Arrays** — each element indexed separately → large arrays = expensive
+- ⚠️ **Embedding arrays** (hundreds/thousands of floats) should be **excluded from range indexes** — they get vector indexes instead
+
+> ⚠️ **Exam trap:** Partition key is **NOT auto-indexed** (unless it's also `/id`). You must explicitly include it, or filtering on it causes full scans.
+
+---
+
+## 5. Include / Exclude Path Syntax
+
+| Syntax | Meaning |
+|---|---|
+| `/*` | All properties, recursively |
+| `/propertyName/?` | Scalar value only |
+| `/arrayName/[]` | All elements in an array |
+| `/nested/path/*` | All properties under nested path |
+
+**Precedence rule:** More specific path wins when include/exclude conflict.
+
+### Default policy (indexes everything)
+```json
+{
+  "indexingMode": "consistent",
+  "automatic": true,
+  "includedPaths": [{ "path": "/*" }],
+  "excludedPaths": [{ "path": "/\"_etag\"/?" }]
+}
+```
+
+### Selective policy (index only what you query)
+```json
+{
+  "indexingMode": "consistent",
+  "automatic": true,
+  "includedPaths": [
+    { "path": "/title/?" },
+    { "path": "/category/?" },
+    { "path": "/createdDate/?" },
+    { "path": "/metadata/*" }
+  ],
+  "excludedPaths": [{ "path": "/*" }]
+}
+```
+
+---
+
+## 6. System Properties
+
+| Property | Indexing Behavior |
+|---|---|
+| `id`, `_ts` | Always indexed (consistent mode) — cannot disable |
+| `_etag` | Excluded by default; can include if you filter on it (rare) |
+
+---
+
+## 7. Composite Indexes — Deep Dive
+
+**Needed when:** `ORDER BY` uses **2+ properties**, or you combine equality + range filters on different properties.
+
+- Must match **exact property sequence + sort direction**.
+- A composite index `(A DESC, B DESC)` also supports the fully reversed `(A ASC, B ASC)` — but **NOT mixed directions** like `(A DESC, B ASC)`. That needs its own separate composite index.
+
+```json
+"compositeIndexes": [
+  [
+    { "path": "/relevanceScore", "order": "descending" },
+    { "path": "/uploadDate", "order": "descending" }
+  ]
+]
+```
+
+### 💡 Filter + Sort optimization trick
+Rewrite:
+```sql
+WHERE c.documentType = 'pdf' ORDER BY c.uploadDate DESC
+```
+as:
+```sql
+WHERE c.documentType = 'pdf' ORDER BY c.documentType, c.uploadDate DESC
+```
+This lets a **single composite index** `(documentType ASC, uploadDate DESC)` serve the whole query.
+
+### Multi-property filter rule
+- Put **equality filters first**, range filter **last** (max **one range filter per composite index**).
+- Multiple range filters → need **multiple composite indexes** (used together).
+
+```
+Query: name = X AND age > 18 AND timestamp > Y
+→ Index 1: (name ASC, age ASC)
+→ Index 2: (name ASC, timestamp ASC)
+```
+
+---
+
+## 8. Tuple Indexes
+
+Used for filtering **multiple properties inside the same array element** (e.g., chunked documents).
+
+```json
+{
+  "includedPaths": [
+    { "path": "/*" },
+    { "path": "/chunks/[]/{position, tokens}/?" }
+  ]
+}
+```
+Great for RAG/chunking scenarios: filter on chunk `position` + `tokens` together.
+
+---
+
+## 9. Vector Indexes
+
+Vector policy (path, data type, dimensions, distance function) is set at **container creation** and is **IMMUTABLE**.
+
+### Vector Index Types
+
+| Type | Best For | Accuracy | Max Dimensions | Notes |
+|---|---|---|---|---|
+| **Flat** | Small datasets | 100% (brute-force) | 505 | High latency/RU at scale; good if filters shrink candidate set |
+| **quantizedFlat** | Medium (~1K–50K vectors/partition) | Slight accuracy loss | 4,096 | Compressed vectors, brute-force on compressed data |
+| **diskANN** | Large (50K+ vectors/partition) | High (approximate) | 4,096 | ✅ Recommended for production; lowest latency/RU |
+
+> ⚠️ **Exam trap:** Both `quantizedFlat` and `diskANN` need **≥1,000 vectors** before the index is effective — below that, falls back to brute-force scan (unexpectedly high RU).
+
+### Tunable Parameters
+| Parameter | Applies To | Range | Effect |
+|---|---|---|---|
+| `quantizationByteSize` | quantizedFlat, diskANN | 1–512 | Higher = more accuracy, more storage |
+| `indexingSearchListSize` | diskANN only | 10–500 (default 100) | Higher = better index quality, slower build |
+
+### Example: full policy combining vector + metadata indexes
+```json
+{
+  "indexingMode": "consistent",
+  "includedPaths": [
+    { "path": "/category/?" },
+    { "path": "/createdDate/?" }
+  ],
+  "excludedPaths": [
+    { "path": "/*" },
+    { "path": "/embedding/*" }
+  ],
+  "compositeIndexes": [[
+    { "path": "/category", "order": "ascending" },
+    { "path": "/createdDate", "order": "descending" }
+  ]],
+  "vectorIndexes": [
+    { "path": "/embedding", "type": "diskANN" }
+  ]
+}
+```
+
+✅ Always **exclude embedding paths from range indexes** — vector search uses vector indexes, not range indexes.
+
+---
+
+## 10. Index Transformation (Policy Changes)
+
+| Action | Behavior |
+|---|---|
+| **Add index** | Doesn't help queries until transformation **completes** (async) |
+| **Remove index** | Queries stop using it **immediately** (before transformation finishes) → may fall back to scan |
+| **Replace index** | Best practice: **add new index → wait for completion → then remove old index** |
+
+> Plan policy changes during low-traffic periods; large containers can take a long time to transform.
+
+---
+
+## 11. RU Optimization Strategy (Cheat Sheet)
+
+1. **Analyze real query patterns** — filters, sorts, combos, frequency. Don't index "just in case."
+2. **Use query metrics** — check index utilization %, retrieved vs. output document counts (`x-ms-documentdb-query-metrics` header).
+3. **Exclude unused properties** — big text blobs, embeddings not used in range queries.
+4. **Always index the partition key path** if queries filter on it.
+5. **Prioritize composite indexes** for your top 5–10 most frequent query patterns — don't over-index.
+6. **Match indexing depth to workload type:**
+   - **Write-heavy** → minimal indexing (fewer props, fewer composites)
+   - **Read-heavy** → invest in comprehensive indexing (most AI apps are read-heavy)
+7. **Test with realistic data** — cardinality/distribution affects real RU cost; synthetic uniform data can mislead.
+
+---
+
+## 12. Consistency Levels
+
+Five levels, from strongest to weakest:
+
+| Level | Guarantee | Replicas Read | RU Cost | Multi-Region Write? |
+|---|---|---|---|---|
+| **Strong** | Linearizable — always latest committed write | 2 (quorum) | 2× | ❌ Not supported |
+| **Bounded Staleness** | Lag ≤ K versions or T seconds | 2 (quorum) | 2× | Best for single-region write |
+| **Session** ⭐ | Read-your-writes within a session | 1 | 1× | ✅ |
+| **Consistent Prefix** | No out-of-order reads (but can be stale) | 1 | 1× | ✅ |
+| **Eventual** | Weakest — no ordering guarantee | 1 | 1× | ✅ Highest throughput/availability |
+
+⭐ **Session consistency = default recommendation for most AI / user-facing apps.**
+- Guarantees a user sees their own uploads/writes immediately.
+- Managed via **session tokens** (SDK handles automatically per client; must pass explicitly across distributed services).
+
+### Quick Decision Guide
+- **Financial/transactional, zero tolerance for stale data** → Strong
+- **Single-region write, need predictable cross-region freshness** → Bounded Staleness
+- **Typical user-facing app / RAG search** → Session
+- **Audit logs / event streams where order matters, not freshness** → Consistent Prefix
+- **Analytics, background jobs, dashboards** → Eventual
+
+### Vector Search & Consistency
+- Vector similarity search generally tolerates **eventual consistency** (semantic results don't need to be millisecond-fresh).
+- Use **session consistency** if users expect to immediately find just-uploaded/embedded content.
+
+### Multi-Region Notes
+- **Strong:** waits for replication to ALL regions → higher latency; not supported w/ multi-write regions.
+- **Bounded staleness:** best for single-write-region accounts.
+- **Session/weaker:** confirms after local majority; other regions may briefly lag.
+
+### Monitoring
+- **PBS (Probabilistically Bounded Staleness) metrics** — Portal → Metrics → Consistency category.
+- If eventual consistency returns fresh data >99% of the time → safe to use more broadly.
+- If PBS shows real staleness → switch user-facing ops to Session.
+
+---
+
+## 🎯 Exam-Style Quick Recall
+
+- Partition key → **not auto-indexed**, add manually.
+- `_etag` → excluded by default; `id`/`_ts` → always indexed.
+- Composite index → required for **multi-property ORDER BY**; max **1 range filter** per composite index.
+- Vector policy → **immutable** after container creation.
+- diskANN/quantizedFlat → need **1,000+ vectors** to activate.
+- Removing an index → **takes effect immediately**; adding one → only after transformation completes.
+- Strong/Bounded Staleness → **2× RU** (double replica read) vs Session/Prefix/Eventual → **1× RU**.
+- Lazy indexing mode → **deprecated**, not available for new containers.
